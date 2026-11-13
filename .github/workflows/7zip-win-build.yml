@@ -1,0 +1,200 @@
+name: 7-Zip Windows x64 installer -> CNB
+
+# 方案 C：借 GitHub Actions 的 windows-latest runner 编译完整版 7-Zip，
+# 再把安装包 + 校验和 + 溯源清单推回 CNB 仓库的 dist 分支。
+#
+# 触发链（默认）：本 workflow 每天定时拉 ip7z/7zip 上游源码编译，完全独立于 CNB。
+# 触发链（可选，更严谨）：CNB 同步完成后发 repository_dispatch，带上 commit SHA，
+#   本 workflow 按该 SHA 编译，保证「CNB 镜像代码 ↔ 安装包」严格一一对应。
+#   开启方式见 cnb-7zip-mirror/.cnb.yml 顶部注释。
+
+on:
+  schedule:
+    # CNB 镜像在 Asia/Shanghai 04:17（= 前一日 UTC 20:17）同步，这里 UTC 21:17 留 1 小时余量
+    - cron: '17 21 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'ip7z/7zip 的分支 / tag / commit SHA'
+        required: false
+        default: 'main'
+      build_msi:
+        description: '额外用官方 DOC/7zip.wxs 打 MSI（需要 WiX 3.14 与额外资源文件）'
+        type: boolean
+        required: false
+        default: false
+  repository_dispatch:
+    types: [cnb-mirror-synced]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 7zip-win-x64
+  cancel-in-progress: false
+
+env:
+  CNB_REPO: timmxy/TimChen7763/7zip
+  DIST_BRANCH: dist
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Resolve upstream ref
+        id: ref
+        shell: pwsh
+        run: |
+          $ref = '${{ inputs.upstream_ref }}'
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = '${{ github.event.client_payload.commit }}' }
+          if ([string]::IsNullOrWhiteSpace($ref)) { $ref = 'main' }
+          "ref=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "upstream ref = $ref"
+
+      - name: Checkout upstream 7-Zip source
+        uses: actions/checkout@v4
+        with:
+          repository: ip7z/7zip
+          ref: ${{ steps.ref.outputs.ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Checkout build scripts (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Read version and record provenance
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = (git -C src rev-parse HEAD).Trim()
+          $hdr = Get-Content 'src/C/7zVersion.h' -Raw
+          $m = [regex]::Match($hdr, '#define\s+MY_VERSION_NUMBERS\s+"([^"]+)"')
+          if (-not $m.Success) { throw 'Cannot read MY_VERSION_NUMBERS from C/7zVersion.h' }
+          $ver = $m.Groups[1].Value
+          $vn  = $ver -replace '[^0-9]', ''
+          "sha=$sha"        | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$ver"    | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "versionnum=$vn"  | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "upstream_commit=$sha  version=$ver"
+
+      - name: Setup MSVC x64 build environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build x64 binaries (MSVC nmake)
+        shell: cmd
+        run: |
+          set "ROOT=%GITHUB_WORKSPACE%\src\CPP\7zip"
+          for %%D in (Bundles\Format7zF Bundles\SFXWin Bundles\SFXCon UI\Console UI\Explorer UI\FileManager UI\GUI) do (
+            echo ==== building %%D ====
+            cd /d "%ROOT%\%%D" || exit /b 1
+            nmake PLATFORM=x64 NEW_COMPILER=1 MY_STATIC_LINK=1 || exit /b 1
+          )
+
+      - name: Build optional x64 components (non-blocking)
+        continue-on-error: true
+        shell: cmd
+        run: |
+          set "ROOT=%GITHUB_WORKSPACE%\src\CPP\7zip"
+          for %%D in (Bundles\SFXSetup Bundles\Alone) do (
+            echo ==== optional %%D ====
+            cd /d "%ROOT%\%%D"
+            nmake PLATFORM=x64 NEW_COMPILER=1 MY_STATIC_LINK=1
+          )
+
+      - name: Setup MSVC x86 cross environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Build 32-bit Shell extension (7-zip32.dll, MSI 需要)
+        continue-on-error: true
+        shell: cmd
+        run: |
+          cd /d "%GITHUB_WORKSPACE%\src\CPP\7zip\UI\Explorer"
+          nmake PLATFORM=x86 NEW_COMPILER=1 MY_STATIC_LINK=1 || exit /b 1
+
+      - name: Stage binaries and docs
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\ci\scripts\prepare-staging.ps1" `
+            -Src "$env:GITHUB_WORKSPACE\src" `
+            -Stage "$env:GITHUB_WORKSPACE\staging"
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress --limit-output
+          $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          if (-not (Test-Path $makensis)) { throw 'makensis.exe not found after install' }
+          & $makensis /VERSION
+
+      - name: Build EXE installer (NSIS)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\dist" | Out-Null
+          Copy-Item "$env:GITHUB_WORKSPACE\ci\scripts\7zip-x64.nsi" "$env:GITHUB_WORKSPACE\installer.nsi" -Force
+          $name = "7z${{ steps.meta.outputs.versionnum }}-x64.exe"
+          & 'C:\Program Files (x86)\NSIS\makensis.exe' /V2 `
+            "/DPRODUCT_VERSION=${{ steps.meta.outputs.version }}" `
+            "/DSTAGE=$env:GITHUB_WORKSPACE\staging" `
+            "/DOUTFILE=$env:GITHUB_WORKSPACE\dist\$name" `
+            "$env:GITHUB_WORKSPACE\installer.nsi"
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with $LASTEXITCODE" }
+          Get-Item "$env:GITHUB_WORKSPACE\dist\$name" | Select-Object Name, Length
+
+      - name: Install WiX 3.14
+        if: ${{ inputs.build_msi == true }}
+        shell: pwsh
+        run: |
+          choco install wixtoolset --version=3.14.1 -y --no-progress --limit-output
+          $candle = 'C:\Program Files (x86)\WiX Toolset v3.14\bin\candle.exe'
+          if (-not (Test-Path $candle)) { throw 'WiX 3.14 candle.exe not found' }
+
+      - name: Build MSI installer (official DOC/7zip.wxs)
+        if: ${{ inputs.build_msi == true }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\ci\scripts\build-msi.ps1" `
+            -Src "$env:GITHUB_WORKSPACE\src" `
+            -Stage "$env:GITHUB_WORKSPACE\staging" `
+            -Out "$env:GITHUB_WORKSPACE\dist" `
+            -Version "${{ steps.meta.outputs.version }}"
+
+      - name: Generate SHA256SUMS and provenance manifest
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE\ci\scripts\write-manifest.ps1" `
+            -Dist "$env:GITHUB_WORKSPACE\dist" `
+            -Version "${{ steps.meta.outputs.version }}" `
+            -UpstreamCommit "${{ steps.meta.outputs.sha }}" `
+            -RunId "${{ github.run_id }}"
+
+      - name: Publish installers to CNB dist branch
+        shell: pwsh
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CNB_TOKEN)) { throw 'GitHub Secret CNB_TOKEN is missing' }
+          & "$env:GITHUB_WORKSPACE\ci\scripts\publish-to-cnb.ps1" `
+            -Repo "$env:CNB_REPO" `
+            -Branch "$env:DIST_BRANCH" `
+            -Token $env:CNB_TOKEN `
+            -Dist "$env:GITHUB_WORKSPACE\dist" `
+            -Version "${{ steps.meta.outputs.version }}" `
+            -UpstreamCommit "${{ steps.meta.outputs.sha }}"
+
+      - name: Keep a copy on GitHub Actions artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 7zip-win-x64-${{ steps.meta.outputs.versionnum }}
+          path: dist/
+          if-no-files-found: warn
+          retention-days: 30
